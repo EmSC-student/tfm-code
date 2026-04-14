@@ -3,7 +3,6 @@ import mediapipe as mp
 import numpy as np
 import time
 import csv
-import os
 from datetime import datetime
 from angulos import (
     angulo_tronco_vertical,
@@ -14,6 +13,7 @@ from angulos import (
     calcular_angulo_3puntos,
 )
 from reba import calcular_reba_completo
+from repeticiones import DetectorRepeticiones, FiltroAngulos, GestorOclusiones
 
 
 # ==============================================================================
@@ -24,10 +24,13 @@ ALTURA_REFERENCIA_CM = 170  # Altura de referencia estándar en cm
 CAMARA_ID = 0               # ID de la cámara (0 = webcam por defecto)
 GUARDAR_CSV = True          # Guardar datos en CSV automáticamente
 MOSTRAR_ESQUELETO = True     # Mostrar landmarks de MediaPipe
+VENTANA_AUTOCORRELACION_S = 10.0 # Ventana de tiempo para analizar repeticiones (en segundos)
+ALPHA_EMA = 0.3 # Coeficiente de suavizado para filtro EMA de ángulos (0-1)
+UMBRAL_VISIBILIDAD = 0.5 # Umbral de visibilidad para considerar un landmark como válido (0-1)
 
 
 # ==============================================================================
-# CLASE DE CALIBRACIÓN
+# CALIBRADOR
 # ==============================================================================
 
 class Calibrador:
@@ -47,9 +50,9 @@ class Calibrador:
         self.px_por_cm = None
         self.altura_sujeto_cm = ALTURA_REFERENCIA_CM
         self.altura_px = None
-        self.factor_escala = 1.0  # Ratio altura_sujeto / altura_referencia
+        self.factor_escala = 1.0 # Ratio altura_sujeto / altura_referencia
         self.muestras_altura_px = []
-        self.n_muestras = 30  # Promedia 30 frames para más estabilidad
+        self.n_muestras = 30 # Promedia 30 frames para más estabilidad
         self.calibrando = False
         self.inicio_calibracion = None
 
@@ -69,7 +72,6 @@ class Calibrador:
         """
         if not self.calibrando:
             return
-
         try:
             nariz = landmarks[0]
             tobillo_izq = landmarks[27]
@@ -77,12 +79,10 @@ class Calibrador:
 
             # Punto más alto: nariz
             y_superior = nariz.y * h_imagen
-
             # Punto más bajo: promedio de tobillos
             y_inferior = ((tobillo_izq.y + tobillo_der.y) / 2) * h_imagen
-
             altura_px_muestra = abs(y_inferior - y_superior)
-
+            
             # Solo añadir si la persona está completamente visible
             if (nariz.visibility > 0.7 and
                     tobillo_izq.visibility > 0.5 and
@@ -94,7 +94,7 @@ class Calibrador:
                 self._finalizar_calibracion()
 
         except Exception as e:
-            print(f"[Calibración] Error en muestra: {e}")
+            print(f"[Calibración] Error: {e}")
 
     def _finalizar_calibracion(self):
         """Calcula los parámetros de calibración finales."""
@@ -106,22 +106,16 @@ class Calibrador:
         print(f"[Calibración] Completada:")
         print(f"  Altura en px: {self.altura_px:.1f}")
         print(f"  px/cm: {self.px_por_cm:.2f}")
-        print(f"  Factor escala: {self.factor_escala:.3f}")
+        
 
     def estado(self):
         """Devuelve el estado actual de la calibración como string."""
         if self.calibrado:
             return f"CAL OK ({self.altura_sujeto_cm}cm)"
         elif self.calibrando:
-            progreso = len(self.muestras_altura_px)
-            return f"Calibrando... {progreso}/{self.n_muestras}"
+            return f"Calibrando... {len(self.muestras_altura_px)}/{self.n_muestras}"
         else:
             return "Sin calibrar [ESPACIO]"
-
-    def segundos_calibrando(self):
-        if self.inicio_calibracion:
-            return time.time() - self.inicio_calibracion
-        return 0
 
 
 # ==============================================================================
@@ -133,32 +127,11 @@ def seleccionar_lado(landmarks):
     Selecciona el lado (izquierdo/derecho) más visible para el análisis.
     Compara la visibilidad media de hombro, codo, muñeca, cadera, rodilla.
     """
-    indices_izq = [11, 13, 15, 23, 25, 27]  # hombro, codo, muñeca, cadera, rodilla, tobillo
+    indices_izq = [11, 13, 15, 23, 25, 27] # hombro, codo, muñeca, cadera, rodilla, tobillo
     indices_der = [12, 14, 16, 24, 26, 28]
-
     vis_izq = np.mean([landmarks[i].visibility for i in indices_izq])
     vis_der = np.mean([landmarks[i].visibility for i in indices_der])
-
     return "izq" if vis_izq >= vis_der else "der"
-
-
-def obtener_punto(landmarks, idx, w, h, normalizado=True):
-    """
-    Devuelve las coordenadas de un landmark.
-    
-    normalizado=True → [x_norm, y_norm] (0 a 1)
-    normalizado=False → [x_px, y_px] (píxeles)
-    """
-    lm = landmarks[idx]
-    if normalizado:
-        return [lm.x, lm.y]
-    else:
-        return [int(lm.x * w), int(lm.y * h)]
-
-
-def punto_px(punto_norm, w, h):
-    """Convierte coordenadas normalizadas a píxeles."""
-    return (int(punto_norm[0] * w), int(punto_norm[1] * h))
 
 
 def extraer_landmarks(landmarks, lado):
@@ -167,29 +140,26 @@ def extraer_landmarks(landmarks, lado):
     Devuelve un diccionario con coordenadas normalizadas [x, y].
     """
     if lado == "izq":
-        idx = {
-            "hombro": 11, "codo": 13, "muneca": 15,
-            "indice": 19,  # Índice de la mano
-            "cadera": 23, "rodilla": 25, "tobillo": 27,
-            "oreja": 7,
-        }
+        idx = {"hombro": 11, "codo": 13, "muneca": 15,
+               "indice": 19, "cadera": 23, "rodilla": 25,
+               "tobillo": 27, "oreja": 7} # Índice de la mano
     else:
-        idx = {
-            "hombro": 12, "codo": 14, "muneca": 16,
-            "indice": 20,
-            "cadera": 24, "rodilla": 26, "tobillo": 28,
-            "oreja": 8,
-        }
-    # Nariz es siempre 0
-    idx["nariz"] = 0
+        idx = {"hombro": 12, "codo": 14, "muneca": 16,
+               "indice": 20, "cadera": 24, "rodilla": 26,
+               "tobillo": 28, "oreja": 8}
+    idx["nariz"] = 0 # Nariz es siempre 0
 
     puntos = {}
     for nombre, i in idx.items():
         lm = landmarks[i]
         puntos[nombre] = [lm.x, lm.y]
         puntos[nombre + "_vis"] = lm.visibility
-
     return puntos
+
+
+def punto_px(punto_norm, w, h):
+    """Convierte coordenadas normalizadas a píxeles."""
+    return (int(punto_norm[0] * w), int(punto_norm[1] * h))
 
 
 def calcular_angulo_rodilla_reba(puntos):
@@ -198,144 +168,142 @@ def calcular_angulo_rodilla_reba(puntos):
     0° = pierna recta, valores positivos = flexión.
     """
     ang_3p = calcular_angulo_3puntos(
-        puntos["cadera"], puntos["rodilla"], puntos["tobillo"]
-    )
-    # El ángulo 3 puntos da 180° cuando la pierna está recta
+        puntos["cadera"], puntos["rodilla"], puntos["tobillo"])
+    # El ángulo 3 puntos da 180° cuando la pierna está recta, y disminuye al flexionar.
     return abs(180 - ang_3p)
 
 
-def dibujar_panel_info(frame, reba_result, angulos_dict, lado, calibrador, w, h):
+# ==============================================================================
+# VISUALIZACIÓN
+# ==============================================================================
+
+def dibujar_panel_info(frame, reba_result, angulos_dict, lado, calibrador,
+                       rep_resultado, w, h):
     """
     Dibuja el panel de información ergonómica en el frame.
     """
     # Panel de fondo semitransparente en la parte izquierda
     overlay = frame.copy()
-    panel_w = 320
+    panel_w = 340
     cv2.rectangle(overlay, (0, 0), (panel_w, h), (20, 20, 30), -1)
     cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
 
-    color_titulo = (200, 200, 255)
-    color_ok = (100, 255, 100)
-    color_warn = (50, 200, 255)
-    color_alto = (50, 100, 255)
-    color_texto = (220, 220, 220)
+    C_TIT  = (200, 200, 255) #color título
+    C_OK   = (100, 255, 100) #color ok
+    C_WARN = (50, 200, 255) #color warning
+    C_HIGH = (50, 100, 255) #color alto
+    C_TXT  = (220, 220, 220) #color texto
+    C_REP  = (50, 255, 200) #color repetición
 
-    def texto(msg, x, y, color=(220, 220, 220), escala=0.5, grosor=1):
+    def t(msg, x, y, color=C_TXT, s=0.45, g=1):
         cv2.putText(frame, msg, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    escala, color, grosor, cv2.LINE_AA)
+                    s, color, g, cv2.LINE_AA)
+
+    def linea(y):
+        cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
 
     y = 22
     # Título
-    texto("ANÁLISIS REBA", 10, y, color_titulo, 0.65, 2)
-    y += 6
-    cv2.line(frame, (10, y), (panel_w - 10, y), color_titulo, 1)
-    y += 16
+    t("ANÁLISIS REBA v2", 10, y, C_TIT, 0.6, 2)
+    y += 6; linea(y); y += 14
 
     # Estado calibración
-    estado_cal = calibrador.estado()
-    col_cal = color_ok if calibrador.calibrado else (50, 150, 255)
-    texto(f"Calibracion: {estado_cal}", 10, y, col_cal, 0.45, 1)
-    y += 14
-    texto(f"Lado analizado: {lado.upper()}", 10, y, color_texto, 0.45)
-    y += 18
-
-    cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
-    y += 12
+    t(f"Calibracion: {calibrador.estado()}", 10, y,
+      C_OK if calibrador.calibrado else (50, 150, 255))
+    y += 13
+    t(f"Lado: {lado.upper()}", 10, y)
+    y += 16; linea(y); y += 12
 
     # Ángulos
-    texto("ÁNGULOS (grados)", 10, y, color_titulo, 0.48, 1)
-    y += 14
-    ang_data = [
-        ("Tronco/vertical", angulos_dict.get("tronco", 0)),
-        ("Cuello/tronco", angulos_dict.get("cuello", 0)),
-        ("Brazo/tronco", angulos_dict.get("brazo", 0)),
-        ("Antebrazo (codo)", angulos_dict.get("antebrazo", 0)),
-        ("Muñeca", angulos_dict.get("muneca", 0)),
-        ("Rodilla (flex.)", angulos_dict.get("rodilla", 0)),
-    ]
-    for nombre, valor in ang_data:
-        texto(f"  {nombre}: {valor:.1f}°", 10, y, color_texto, 0.42)
-        y += 13
-
-    y += 5
-    cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
-    y += 12
+    t("ÁNGULOS (°)", 10, y, C_TIT, 0.47, 1)
+    y += 13
+    for nombre, clave in [("Tronco/vertical", "tronco"),
+                           ("Cuello/tronco", "cuello"),
+                           ("Brazo/tronco", "brazo"),
+                           ("Antebrazo (codo)", "antebrazo"),
+                           ("Muñeca", "muneca"),
+                           ("Rodilla (flex.)", "rodilla")]:
+        val = angulos_dict.get(clave, 0)
+        t(f"  {nombre}: {val:.1f}", 10, y, C_TXT, 0.4)
+        y += 12
+    y += 4; linea(y); y += 12
 
     # Scores individuales
-    texto("SCORES INDIVIDUALES", 10, y, color_titulo, 0.48, 1)
-    y += 14
-
-    score_items = [
-        ("Tronco", reba_result["s_tronco"], 4),
-        ("Cuello", reba_result["s_cuello"], 3),
-        ("Piernas", reba_result["s_piernas"], 4),
-        ("Brazo", reba_result["s_brazo"], 6),
-        ("Antebrazo", reba_result["s_antebrazo"], 2),
-        ("Muñeca", reba_result["s_muneca"], 3),
-    ]
-
-    for nombre, score, max_score in score_items:
+    t("SCORES INDIVIDUALES", 10, y, C_TIT, 0.47, 1)
+    y += 13
+    items = [("Tronco", "s_tronco", 4), ("Cuello", "s_cuello", 3),
+             ("Piernas", "s_piernas", 4), ("Brazo", "s_brazo", 6),
+             ("Antebrazo", "s_antebrazo", 2), ("Muñeca", "s_muneca", 3)]
+    
+    for nombre, key, max_s in items:
         # Color según nivel del score
-        ratio = score / max_score
-        if ratio <= 0.4:
-            sc = color_ok
-        elif ratio <= 0.7:
-            sc = color_warn
-        else:
-            sc = color_alto
-
+        score = reba_result[key]
+        ratio = score / max_s
+        sc = C_OK if ratio <= 0.4 else (C_WARN if ratio <= 0.7 else C_HIGH)
         # Barra de progreso
-        bar_x = 170
-        bar_w = 100
-        bar_h = 8
-        bar_filled = int(bar_w * ratio)
-        cv2.rectangle(frame, (bar_x, y - 8), (bar_x + bar_w, y), (60, 60, 60), -1)
-        cv2.rectangle(frame, (bar_x, y - 8), (bar_x + bar_filled, y), sc, -1)
-
-        texto(f"  {nombre}: {score}/{max_score}", 10, y, sc, 0.42)
+        bx, bw_bar = 180, 110
+        cv2.rectangle(frame, (bx, y - 8), (bx + bw_bar, y), (60, 60, 60), -1)
+        cv2.rectangle(frame, (bx, y - 8), (bx + int(bw_bar * ratio), y), sc, -1)
+        t(f"  {nombre}: {score}/{max_s}", 10, y, sc, 0.4)
         y += 13
+    y += 4; linea(y); y += 12
 
-    y += 5
-    cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
+    # Sección repeticiones
+    t("MOVIMIENTO REPETITIVO", 10, y, C_REP, 0.47, 1)
+    y += 13
+    es_rep = rep_resultado["es_repetitivo"]
+    rpm = rep_resultado["frecuencia_rpm"]
+    confianza = rep_resultado["confianza"]
+    mod_rep = rep_resultado["modificador_reba"]
+
+    col_rep = C_HIGH if es_rep else C_OK
+    t(f"  Estado: {'SI — DETECTADO' if es_rep else 'No detectado'}", 10, y, col_rep, 0.42)
     y += 12
+    if es_rep:
+        t(f"  Frecuencia: {rpm:.1f} rep/min", 10, y, col_rep, 0.4)
+        y += 12
+    t(f"  Confianza ACF: {confianza:.2f}", 10, y, C_TXT, 0.4)
+    y += 12
+    t(f"  Mod. actividad REBA: +{mod_rep}", 10, y,
+      C_HIGH if mod_rep > 0 else C_TXT, 0.4)
+    y += 14; linea(y); y += 12
 
-    # Scores de tabla
-    texto("PUNTUACIÓN REBA", 10, y, color_titulo, 0.5, 1)
-    y += 14
-    texto(f"  Score A (Grupo A + carga): {reba_result['score_A']}", 10, y, color_texto, 0.43)
-    y += 13
-    texto(f"  Score B (Grupo B + agarre): {reba_result['score_B']}", 10, y, color_texto, 0.43)
-    y += 13
-    texto(f"  Score C (Tabla C): {reba_result['score_C']}", 10, y, color_texto, 0.43)
-    y += 13
-    texto(f"  Mod. actividad: +{reba_result['mod_actividad']}", 10, y, color_texto, 0.43)
-    y += 18
+    # Score final
+    t(f"Score A:{reba_result['score_A']}  B:{reba_result['score_B']}"
+      f"  C:{reba_result['score_C']}  Act:+{reba_result['mod_actividad']}",
+      10, y, C_TXT, 0.38)
+    y += 16
 
+    color_r = reba_result["color_riesgo"]
+    cv2.rectangle(frame, (5, y - 4), (panel_w - 5, y + 36), (0, 0, 0), -1)
+    cv2.rectangle(frame, (5, y - 4), (panel_w - 5, y + 36), color_r, 2)
+    # Score total de REBA
+    t(f"REBA SCORE: {reba_result['score_reba']}/15", 12, y + 13, color_r, 0.6, 2)
     # Score final y nivel de riesgo (destacado)
-    score_final = reba_result["score_reba"]
-    nivel = reba_result["nivel_riesgo"]
-    color_riesgo = reba_result["color_riesgo"]
-
-    cv2.rectangle(frame, (5, y - 4), (panel_w - 5, y + 35), color_riesgo, 2)
-    cv2.rectangle(frame, (5, y - 4), (panel_w - 5, y + 35), (0, 0, 0), -1)
-    cv2.rectangle(frame, (5, y - 4), (panel_w - 5, y + 35), color_riesgo, 2)
-
-    texto(f"REBA SCORE: {score_final}/15", 12, y + 12, color_riesgo, 0.6, 2)
-    texto(f"Riesgo: {nivel}", 12, y + 28, color_riesgo, 0.5, 1)
-
-    y += 50
-    texto(reba_result["accion"], 10, y, (200, 200, 200), 0.38)
+    t(f"Riesgo: {reba_result['nivel_riesgo']}", 12, y + 29, color_r, 0.48)
 
 
-def dibujar_angulo_en_articulacion(frame, punto_px_centro, angulo, label, w, h):
+def dibujar_angulo_en_articulacion(frame, punto_px_c, angulo, label, valido=True):
     """Dibuja el ángulo medido sobre la articulación correspondiente."""
-    x, y = punto_px_centro
-    # Fondo pequeño
+    x, y = punto_px_c
+    color = (255, 255, 100) if valido else (100, 100, 200)
     texto = f"{label}: {angulo:.0f}"
-    (tw, th), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-    cv2.rectangle(frame, (x + 5, y - th - 4), (x + tw + 10, y + 2), (0, 0, 0), -1)
+    (tw, th), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+    cv2.rectangle(frame, (x + 5, y - th - 3), (x + tw + 9, y + 2), (0, 0, 0), -1)
     cv2.putText(frame, texto, (x + 7, y - 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 100), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+
+
+def dibujar_barra_buffer(frame, porcentaje, w, h):
+    bh = 6
+    by = h - bh - 2
+    bw = int((w - 350) * porcentaje / 100)
+    cv2.rectangle(frame, (345, by), (w - 5, by + bh), (50, 50, 50), -1)
+    if bw > 0:
+        cv2.rectangle(frame, (345, by), (345 + bw, by + bh), (50, 200, 150), -1)
+    cv2.putText(frame, f"Buffer ACF: {porcentaje:.0f}%",
+                (345, by - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                (150, 200, 150), 1, cv2.LINE_AA)
 
 
 def pedir_altura():
@@ -345,34 +313,30 @@ def pedir_altura():
             h = float(input("\n[Calibración] Introduce la altura del sujeto en cm (ej: 175): "))
             if 100 <= h <= 230:
                 return h
-            else:
-                print("Por favor introduce un valor entre 100 y 230 cm.")
+            print("Por favor introduce un valor entre 100 y 230 cm.")
         except ValueError:
             print("Valor no válido. Introduce un número.")
 
 
-def guardar_fila_csv(writer, timestamp, lado, angulos_dict, reba_result):
+def guardar_fila_csv(writer, timestamp, lado, angulos_dict, reba_result, rep_resultado):
     """Escribe una fila de datos en el CSV."""
     writer.writerow([
-        timestamp,
-        lado,
+        timestamp, lado,
         round(angulos_dict.get("tronco", 0), 2),
         round(angulos_dict.get("cuello", 0), 2),
         round(angulos_dict.get("brazo", 0), 2),
         round(angulos_dict.get("antebrazo", 0), 2),
         round(angulos_dict.get("muneca", 0), 2),
         round(angulos_dict.get("rodilla", 0), 2),
-        reba_result["s_tronco"],
-        reba_result["s_cuello"],
-        reba_result["s_piernas"],
-        reba_result["s_brazo"],
-        reba_result["s_antebrazo"],
-        reba_result["s_muneca"],
-        reba_result["score_A"],
-        reba_result["score_B"],
-        reba_result["score_C"],
-        reba_result["score_reba"],
+        reba_result["s_tronco"], reba_result["s_cuello"],
+        reba_result["s_piernas"], reba_result["s_brazo"],
+        reba_result["s_antebrazo"], reba_result["s_muneca"],
+        reba_result["score_A"], reba_result["score_B"],
+        reba_result["score_C"], reba_result["score_reba"],
         reba_result["nivel_riesgo"],
+        int(rep_resultado["es_repetitivo"]),
+        round(rep_resultado["frecuencia_rpm"], 2),
+        round(rep_resultado["confianza"], 3),
     ])
 
 
@@ -388,7 +352,7 @@ def main():
     # --- Configuración de MediaPipe ---
     pose_config = mp_pose.Pose(
         static_image_mode=False,
-        model_complexity=1,           # 0=rápido, 1=equilibrado, 2=preciso
+        model_complexity=1, # 0=rápido, 1=equilibrado, 2=preciso
         smooth_landmarks=True,
         enable_segmentation=False,
         min_detection_confidence=0.5,
@@ -404,23 +368,19 @@ def main():
     # Intentar subir resolución
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps_cam = cap.get(cv2.CAP_PROP_FPS) or 30
-    print(f"[Cámara] Resolución: {w}x{h} @ {fps_cam:.0f} fps")
 
     # --- Calibrador ---
     calibrador = Calibrador()
+    detector_rep = DetectorRepeticiones(ventana_s=VENTANA_AUTOCORRELACION_S, fps=fps_cam)
+    filtro_ema = FiltroAngulos(alpha=ALPHA_EMA)
+    gestor_oclusion = GestorOclusiones(umbral_visibilidad=UMBRAL_VISIBILIDAD)
 
     # Preguntar altura inicial
     print("\n=== SISTEMA DE ANÁLISIS ERGONÓMICO REBA ===")
-    print("Controles:")
-    print("  [ESPACIO] - Calibrar con nueva altura")
-    print("  [R]       - Iniciar/detener grabación")
-    print("  [S]       - Captura de pantalla")
-    print("  [ESC]     - Salir")
-
+    print("Controles: [ESPACIO] calibrar | [R] grabar | [S] captura | [ESC] salir")
     altura_inicial = pedir_altura()
     calibrador.iniciar_calibracion(altura_inicial)
 
@@ -439,16 +399,17 @@ def main():
             "s_brazo", "s_antebrazo", "s_muneca",
             "score_A", "score_B", "score_C",
             "score_reba", "nivel_riesgo",
+            "repetitivo", "frecuencia_rpm", "confianza_acf",
         ])
         print(f"[CSV] Guardando datos en: {nombre_csv}")
 
     # --- Grabación de vídeo ---
     grabando = False
     video_writer = None
-
     # --- Bucle principal ---
-    reba_result_anterior = None
-    angulos_anterior = {}
+    reba_result_ant = None
+    angulos_ant = {}
+    rep_resultado_ant = detector_rep.resultado
     frame_count = 0
     t_inicio = time.time()
 
@@ -459,12 +420,10 @@ def main():
                 print("[Error] No se recibe imagen de la cámara.")
                 break
 
-            h_frame, w_frame, _ = frame.shape
+            h_f, w_f, _ = frame.shape
             frame_count += 1
-
-            # FPS real
-            elapsed = time.time() - t_inicio
-            fps_real = frame_count / elapsed if elapsed > 0 else 0
+            # FPS real calculado cada 30 frames para evitar fluctuaciones
+            fps_real = frame_count / max(time.time() - t_inicio, 0.001)
 
             # --- PROCESAR CON MEDIAPIPE ---
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -472,172 +431,152 @@ def main():
             results = pose.process(image_rgb)
             image_rgb.flags.writeable = True
 
-            reba_result = reba_result_anterior
-            angulos_dict = angulos_anterior
+            reba_result = reba_result_ant
+            angulos_dict = angulos_ant
+            rep_resultado = rep_resultado_ant
             lado = "izq"
+            validez = {}
 
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
 
                 # Calibración en progreso
                 if calibrador.calibrando:
-                    calibrador.actualizar(landmarks, h_frame)
+                    calibrador.actualizar(landmarks, h_f)
 
-                # Seleccionar lado más visible
+                # Seleccionar lado más visible y extraer puntos clave
                 lado = seleccionar_lado(landmarks)
                 puntos = extraer_landmarks(landmarks, lado)
 
-                # ==============================
-                # CALCULAR ÁNGULOS CORRECTAMENTE
-                # ==============================
+                # Calcula ángulos
+                ang_tronco_raw   = angulo_tronco_vertical(puntos["hombro"], puntos["cadera"]) # TRONCO: ángulo del segmento cadera-hombro respecto a la vertical
+                ang_cuello_raw   = angulo_cuello(puntos["oreja"], puntos["hombro"], puntos["cadera"]) # CUELLO: ángulo de la cabeza respecto al tronco
+                ang_brazo_raw    = angulo_brazo_tronco(puntos["hombro"], puntos["codo"], puntos["cadera"]) # BRAZO: ángulo del húmero respecto al tronco
+                ang_antebrazo_raw= angulo_antebrazo(puntos["hombro"], puntos["codo"], puntos["muneca"]) # ANTEBRAZO: ángulo del antebrazo respecto al brazo, codo como vértice (hombro-codo-muñeca)
+                ang_muneca_raw   = angulo_muneca(puntos["codo"], puntos["muneca"], puntos["indice"]) # MUNECA: ángulo de la muñeca respecto al antebrazo (codo-muñeca-índice)
+                ang_rodilla_raw  = calcular_angulo_rodilla_reba(puntos) # RODILLA: ángulo de la rodilla respecto a la vertical (flexión)
 
-                # TRONCO: ángulo del segmento cadera-hombro respecto a la vertical
-                ang_tronco = angulo_tronco_vertical(
-                    puntos["hombro"], puntos["cadera"]
-                )
+                # Gestión de oclusiones
+                ang_tronco,    val_t = gestor_oclusion.validar_angulo("tronco",    ang_tronco_raw,    [puntos["hombro_vis"], puntos["cadera_vis"]])
+                ang_cuello,    val_c = gestor_oclusion.validar_angulo("cuello",    ang_cuello_raw,    [puntos["oreja_vis"],  puntos["hombro_vis"]])
+                ang_brazo,     val_b = gestor_oclusion.validar_angulo("brazo",     ang_brazo_raw,     [puntos["hombro_vis"], puntos["codo_vis"]])
+                ang_antebrazo, val_a = gestor_oclusion.validar_angulo("antebrazo", ang_antebrazo_raw, [puntos["codo_vis"],   puntos["muneca_vis"]])
+                ang_muneca,    val_m = gestor_oclusion.validar_angulo("muneca",    ang_muneca_raw,    [puntos["muneca_vis"], puntos["indice_vis"]])
+                ang_rodilla,   val_r = gestor_oclusion.validar_angulo("rodilla",   ang_rodilla_raw,   [puntos["rodilla_vis"],puntos["tobillo_vis"]])
 
-                # CUELLO: ángulo de la cabeza respecto al tronco
-                ang_cuello = angulo_cuello(
-                    puntos["oreja"], puntos["hombro"], puntos["cadera"]
-                )
+                validez = {"tronco": val_t, "cuello": val_c, "brazo": val_b,
+                           "antebrazo": val_a, "muneca": val_m, "rodilla": val_r}
 
-                # BRAZO: ángulo del húmero respecto al tronco
-                ang_brazo = angulo_brazo_tronco(
-                    puntos["hombro"], puntos["codo"], puntos["cadera"]
-                )
+                # Filtro EMA
+                angulos_dict = filtro_ema.filtrar_dict({
+                    "tronco": ang_tronco, "cuello": ang_cuello,
+                    "brazo": ang_brazo, "antebrazo": ang_antebrazo,
+                    "muneca": ang_muneca, "rodilla": ang_rodilla,
+                })
 
-                # ANTEBRAZO: ángulo en el codo (hombro-codo-muñeca)
-                ang_antebrazo = angulo_antebrazo(
-                    puntos["hombro"], puntos["codo"], puntos["muneca"]
-                )
+                # Detector de repeticiones
+                detector_rep.añadir_muestra([
+                    angulos_dict["tronco"], angulos_dict["cuello"],
+                    angulos_dict["brazo"], angulos_dict["antebrazo"],
+                ])
+                rep_resultado = detector_rep.analizar(frame_count)
+                rep_resultado_ant = rep_resultado
 
-                # MUÑECA: ángulo codo-muñeca-índice
-                ang_muneca = angulo_muneca(
-                    puntos["codo"], puntos["muneca"], puntos["indice"]
-                )
-
-                # RODILLA: flexión de la rodilla
-                ang_rodilla = calcular_angulo_rodilla_reba(puntos)
-
-                angulos_dict = {
-                    "tronco": ang_tronco,
-                    "cuello": ang_cuello,
-                    "brazo": ang_brazo,
-                    "antebrazo": ang_antebrazo,
-                    "muneca": ang_muneca,
-                    "rodilla": ang_rodilla,
-                }
-
-                # ==============================
-                # SCORE REBA COMPLETO
-                # ==============================
+                # SCORE REBA con modificador automático
                 reba_result = calcular_reba_completo(
-                    angulo_tronco=ang_tronco,
-                    angulo_cuello=ang_cuello,
-                    angulo_rodilla=ang_rodilla,
-                    angulo_brazo=ang_brazo,
-                    angulo_antebrazo_val=ang_antebrazo,
-                    angulo_muneca_val=ang_muneca,
-                    soporte_bilateral=True,  # Ajustable según experimento
+                    angulo_tronco=angulos_dict["tronco"],
+                    angulo_cuello=angulos_dict["cuello"],
+                    angulo_rodilla=angulos_dict["rodilla"],
+                    angulo_brazo=angulos_dict["brazo"],
+                    angulo_antebrazo_val=angulos_dict["antebrazo"],
+                    angulo_muneca_val=angulos_dict["muneca"],
+                    soporte_bilateral=True, # Ajustable según experimento
+                    actividad_repetitiva=rep_resultado["es_repetitivo"],
                 )
 
-                reba_result_anterior = reba_result
-                angulos_anterior = angulos_dict
+                reba_result_ant = reba_result
+                angulos_ant = angulos_dict
 
                 # Guardar en CSV cada 15 frames (~0.5s a 30fps)
                 if GUARDAR_CSV and csv_writer and frame_count % 15 == 0:
                     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    guardar_fila_csv(csv_writer, ts, lado, angulos_dict, reba_result)
+                    guardar_fila_csv(csv_writer, ts, lado, angulos_dict, reba_result, rep_resultado)
 
-                # ==============================
-                # DIBUJAR ESQUELETO
-                # ==============================
+                # Dibujar esqueleto
                 if MOSTRAR_ESQUELETO:
                     mp_drawing.draw_landmarks(
-                        frame,
-                        results.pose_landmarks,
-                        mp_pose.POSE_CONNECTIONS,
-                        landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
-                    )
+                        frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                        landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
 
-                # ==============================
-                # DIBUJAR ÁNGULOS SOBRE CUERPO
-                # ==============================
-                def px(nombre):
-                    return punto_px(puntos[nombre], w_frame, h_frame)
+                # Dibujar ángulos
+                def px(n): return punto_px(puntos[n], w_f, h_f)
+                dibujar_angulo_en_articulacion(frame, px("cadera"),  angulos_dict["tronco"],    "Tronco",    validez.get("tronco", True))
+                dibujar_angulo_en_articulacion(frame, px("hombro"),  angulos_dict["cuello"],    "Cuello",    validez.get("cuello", True))
+                dibujar_angulo_en_articulacion(frame, px("codo"),    angulos_dict["brazo"],     "Brazo",     validez.get("brazo", True))
+                dibujar_angulo_en_articulacion(frame, px("muneca"),  angulos_dict["antebrazo"], "Antebrazo", validez.get("antebrazo", True))
+                dibujar_angulo_en_articulacion(frame, px("rodilla"), angulos_dict["rodilla"],   "Rodilla",   validez.get("rodilla", True))
 
-                dibujar_angulo_en_articulacion(frame, px("cadera"), ang_tronco, "Tronco", w_frame, h_frame)
-                dibujar_angulo_en_articulacion(frame, px("hombro"), ang_cuello, "Cuello", w_frame, h_frame)
-                dibujar_angulo_en_articulacion(frame, px("codo"), ang_brazo, "Brazo", w_frame, h_frame)
-                dibujar_angulo_en_articulacion(frame, px("muneca"), ang_antebrazo, "Antebrazo", w_frame, h_frame)
-                dibujar_angulo_en_articulacion(frame, px("rodilla"), ang_rodilla, "Rodilla", w_frame, h_frame)
-
-            # ==============================
-            # PANEL DE INFORMACIÓN
-            # ==============================
+            # Dibujar panel de información
             if reba_result:
-                dibujar_panel_info(frame, reba_result, angulos_dict, lado, calibrador, w_frame, h_frame)
+                dibujar_panel_info(frame, reba_result, angulos_dict, lado,
+                                   calibrador, rep_resultado, w_f, h_f)
             else:
-                # Sin detección
-                cv2.putText(frame, "Sin deteccion de persona", (340, h_frame // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                # Si no se detectan landmarks, mostrar mensaje central
+                cv2.putText(frame, "Sin deteccion de persona",
+                            (360, h_f // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
-            # Mensaje calibración en curso
+            # Si el calibrador está en modo de calibración, mostrar mensaje
             if calibrador.calibrando:
-                progreso = len(calibrador.muestras_altura_px)
-                msg = f"CALIBRANDO... {progreso}/{calibrador.n_muestras} - Mantente de pie erguido"
-                cv2.putText(frame, msg, (340, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2, cv2.LINE_AA)
+                n = len(calibrador.muestras_altura_px)
+                cv2.putText(frame,
+                            f"CALIBRANDO... {n}/{calibrador.n_muestras} - Mantente erguido",
+                            (360, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 220, 255), 2, cv2.LINE_AA)
 
-            # FPS en esquina superior derecha
-            cv2.putText(frame, f"FPS: {fps_real:.1f}", (w_frame - 110, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            dibujar_barra_buffer(frame, detector_rep.porcentaje_buffer(), w_f, h_f)
 
-            # Indicador de grabación
+            # Mostrar FPS real en la esquina superior derecha
+            cv2.putText(frame, f"FPS: {fps_real:.1f}", (w_f - 110, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Mostrar indicador de grabación
             if grabando:
-                cv2.circle(frame, (w_frame - 20, 60), 8, (0, 0, 255), -1)
-                cv2.putText(frame, "REC", (w_frame - 70, 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                cv2.circle(frame, (w_f - 20, 55), 8, (0, 0, 255), -1)
+                cv2.putText(frame, "REC", (w_f - 70, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
-            # ==============================
-            # MOSTRAR VENTANA
-            # ==============================
-            cv2.imshow("Análisis REBA - Ergonomía", frame)
-
+            cv2.imshow("Análisis REBA v2 — Ergonomía", frame)
             # Grabación de vídeo
             if grabando and video_writer:
                 video_writer.write(frame)
 
-            # ==============================
-            # CONTROLES DE TECLADO
-            # ==============================
+            # Controles de teclado
             key = cv2.waitKey(1) & 0xFF
-
-            if key == 27:  # ESC - Salir
+            if key == 27: # ESC para salir
                 break
-
-            elif key == ord(' '):  # ESPACIO - Recalibrar
-                nueva_altura = pedir_altura()
-                calibrador.iniciar_calibracion(nueva_altura)
-
-            elif key == ord('r') or key == ord('R'):  # R - Grabar
+            elif key == ord(' '): # ESPACIO para calibrar
+                nueva = pedir_altura()
+                calibrador.iniciar_calibracion(nueva)
+                detector_rep.__init__(VENTANA_AUTOCORRELACION_S, fps_cam)
+                filtro_ema.__init__(ALPHA_EMA)
+            elif key in (ord('r'), ord('R')): # R para grabar
                 if not grabando:
-                    nombre_video = f"reba_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
+                    nombre_v = f"reba_{datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
                     fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                    video_writer = cv2.VideoWriter(nombre_video, fourcc, fps_cam, (w_frame, h_frame))
+                    video_writer = cv2.VideoWriter(nombre_v, fourcc, fps_cam, (w_f, h_f))
                     grabando = True
-                    print(f"[Grabación] Iniciada: {nombre_video}")
+                    print(f"[REC] → {nombre_v}")
                 else:
                     grabando = False
                     if video_writer:
                         video_writer.release()
                         video_writer = None
-                    print("[Grabación] Detenida.")
-
-            elif key == ord('s') or key == ord('S'):  # S - Captura
-                nombre_cap = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                cv2.imwrite(nombre_cap, frame)
-                print(f"[Captura] Guardada: {nombre_cap}")
+                    print("[REC] Detenida.")
+            elif key in (ord('s'), ord('S')): # S para captura de pantalla
+                nombre_c = f"captura_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                cv2.imwrite(nombre_c, frame)
+                print(f"[Captura] → {nombre_c}")
 
     # Limpieza
     cap.release()
@@ -645,7 +584,6 @@ def main():
         video_writer.release()
     if csv_file:
         csv_file.close()
-        print(f"[CSV] Archivo cerrado.")
     cv2.destroyAllWindows()
     print("[Sistema] Finalizado.")
 
@@ -661,6 +599,11 @@ if __name__ == "__main__":
   - Visualización con overlay de puntuaciones
   - Grabación de sesión opcional
   - Exportación de datos a CSV
+  - Detección automática de movimientos repetitivos (autocorrelación)
+  - Filtro EMA para suavizar ángulos ruidosos (especialmente muñeca/mano)
+  - Gestión de oclusiones: usa último valor válido si landmark no visible
+  - El modificador de actividad REBA se calcula automáticamente
+  - Panel actualizado con estado de repetición y buffer de autocorrelación
 
 Controles:
   [ESPACIO] - Iniciar/reiniciar calibración
