@@ -204,7 +204,7 @@ def dibujar_panel_info(frame, reba_result, angulos_dict, lado, calibrador,
 
     y = 22
     # Título
-    t("ANÁLISIS REBA v2", 10, y, C_TIT, 0.6, 2)
+    t("ANÁLISIS", 10, y, C_TIT, 0.6, 2)
     y += 6; linea(y); y += 14
 
     # Estado calibración
